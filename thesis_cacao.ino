@@ -1,6 +1,10 @@
 #include <Wire.h>
 #include <LiquidCrystal_I2C.h>
 #include <RTClib.h>
+#include <SPI.h>
+#include "max6675.h"
+#include <PID_v1.h>
+#include <RBDdimmer.h>
 
 // ==================================================
 // LCD I2C 16x2
@@ -16,39 +20,77 @@ LiquidCrystal_I2C lcd(0x27, 16, 2);
 RTC_DS3231 rtc;
 
 // ==================================================
+// MAX6675 THERMOCOUPLE - HARDWARE SPI
+// ==================================================
+#define PIN_THERMO_CLK  52   // SCK (hardware SPI - fixed)
+#define PIN_THERMO_CS   53   // CS (can be any digital pin)
+#define PIN_THERMO_DO   50   // MISO (hardware SPI - fixed)
+
+MAX6675 thermocouple(PIN_THERMO_CLK, PIN_THERMO_CS, PIN_THERMO_DO);
+
+// ==================================================
+// AC DIMMER (RBDDimmer PWM-3)
+// ==================================================
+#define PIN_ZERO_CROSS  2    // INT0 for zero-cross detection (FIXED)
+#define PIN_DIMMER      3    // PWM output for heating element
+
+dimmerLamp dimmer(PIN_DIMMER);
+
+// ==================================================
+// RELAYS
+// ==================================================
+#define PIN_LPG_RELAY   51   // LPG preheat relay
+#define PIN_FAN_RELAY   11   // Fan cooling relay
+
+// ==================================================
 // BUTTON
 // Arduino Pin 40 ---- Button ---- GND
 // ==================================================
-#define PIN_BUTTON 40
+#define PIN_BUTTON      40
 
 // ==================================================
-// LPG RELAY
-// HIGH = ON
-// LOW  = OFF
+// PID VARIABLES
 // ==================================================
-#define PIN_LPG_RELAY 52
+double currentTemp = 0.0;      // Current temperature from MAX6675
+double setPoint = 90.0;        // Target temperature: 90°C
+double pidOutput = 0.0;        // PID output (0-100%)
+
+// PID tuning constants (adjust based on system response)
+double kp = 2.5;               // Proportional gain
+double ki = 0.15;              // Integral gain
+double kd = 1.0;               // Derivative gain
+
+PID pidController(&currentTemp, &pidOutput, &setPoint, kp, ki, kd, DIRECT);
 
 // ==================================================
 // COUNTDOWN SETTINGS
 // ==================================================
-const uint32_t PRE_HEATING_TIME_SEC = 5UL * 60UL;    // 5 minutes
-const uint32_t ROASTING_TIME_SEC    = 25UL * 60UL;   // 25 minutes
-const uint32_t TEMPERING_TIME_SEC   = 5UL * 60UL;    // 5 minutes
+const uint32_t INIT_TIME_SEC        = 5UL;          // 5 seconds initialization
+const uint32_t PRE_HEATING_TIME_SEC = 5UL * 60UL;   // 5 minutes (300 seconds)
+const uint32_t ROASTING_TIME_SEC    = 25UL * 60UL;  // 25 minutes (1500 seconds)
+const uint32_t TEMPERING_TIME_SEC   = 5UL * 60UL;   // 5 minutes (300 seconds)
+const uint32_t STAGE_INTRO_TIME_SEC = 5UL;          // 5 seconds for stage intro
 
-// For testing only:
+// For testing only (uncomment to use):
+// const uint32_t INIT_TIME_SEC        = 3;
 // const uint32_t PRE_HEATING_TIME_SEC = 10;
-// const uint32_t ROASTING_TIME_SEC    = 20;
+// const uint32_t ROASTING_TIME_SEC    = 15;
 // const uint32_t TEMPERING_TIME_SEC   = 10;
+// const uint32_t STAGE_INTRO_TIME_SEC = 3;
 
 // ==================================================
 // PHASES
 // ==================================================
 enum Phase {
   IDLE,
-  PRE_HEATING,
-  ROASTING,
-  TEMPERING,
-  DONE
+  INIT_SCREEN,           // 5 second initialization display
+  PRE_HEATING_INTRO,     // Waiting for button press to start
+  PRE_HEATING,           // Countdown: LPG ON, Fan OFF
+  ROASTING_INTRO,        // 5 second roasting intro
+  ROASTING,              // Countdown: Dimmer PID ON, Fan ON (active cooling)
+  TEMPERING_INTRO,       // 5 second tempering intro
+  TEMPERING,             // Countdown: Fan OFF (passive cooling)
+  DONE                   // Process complete
 };
 
 Phase currentPhase = IDLE;
@@ -58,6 +100,8 @@ Phase currentPhase = IDLE;
 // ==================================================
 uint32_t phaseStartUnix = 0;
 unsigned long lastLCDUpdate = 0;
+unsigned long lastTempRead = 0;
+unsigned long lastPIDCalculation = 0;
 
 // ==================================================
 // LCD PRINT
@@ -84,6 +128,65 @@ void lpgOn() {
 
 void lpgOff() {
   digitalWrite(PIN_LPG_RELAY, LOW);
+}
+
+// ==================================================
+// FAN CONTROL
+// ==================================================
+void fanOn() {
+  digitalWrite(PIN_FAN_RELAY, HIGH);
+}
+
+void fanOff() {
+  digitalWrite(PIN_FAN_RELAY, LOW);
+}
+
+// ==================================================
+// AC DIMMER CONTROL
+// ==================================================
+void setDimmerPower(double power) {
+  // Clamp power between 0 and 100
+  if (power < 0) power = 0;
+  if (power > 100) power = 100;
+  
+  dimmer.setPower((int)power);
+}
+
+// ==================================================
+// READ TEMPERATURE FROM MAX6675
+// ==================================================
+void readTemperature() {
+  unsigned long nowMillis = millis();
+  
+  // Read temperature every 100ms to avoid excessive SPI reads
+  if (nowMillis - lastTempRead >= 100) {
+    lastTempRead = nowMillis;
+    
+    // Read from MAX6675 (hardware SPI)
+    currentTemp = thermocouple.readCelsius();
+    
+    // Check for sensor error (MAX6675 returns -0.25 on error)
+    if (currentTemp < 0) {
+      currentTemp = 0;  // Reset on error
+    }
+  }
+}
+
+// ==================================================
+// PID TEMPERATURE CONTROL
+// ==================================================
+void updatePIDControl() {
+  unsigned long nowMillis = millis();
+  
+  // Calculate PID every 100ms
+  if (nowMillis - lastPIDCalculation >= 100) {
+    lastPIDCalculation = nowMillis;
+    
+    pidController.Compute();
+    
+    // Set dimmer power based on PID output
+    setDimmerPower(pidOutput);
+  }
 }
 
 // ==================================================
@@ -122,12 +225,20 @@ bool buttonPressed() {
 // PHASE DURATION
 // ==================================================
 uint32_t getPhaseDuration() {
+  if (currentPhase == INIT_SCREEN) {
+    return INIT_TIME_SEC;
+  }
+
   if (currentPhase == PRE_HEATING) {
     return PRE_HEATING_TIME_SEC;
   }
 
   if (currentPhase == ROASTING) {
     return ROASTING_TIME_SEC;
+  }
+
+  if (currentPhase == ROASTING_INTRO || currentPhase == TEMPERING_INTRO) {
+    return STAGE_INTRO_TIME_SEC;
   }
 
   if (currentPhase == TEMPERING) {
@@ -184,11 +295,46 @@ String formatTime(uint32_t secondsLeft) {
 // ==================================================
 // START PHASES
 // ==================================================
+void startInitScreen() {
+  currentPhase = INIT_SCREEN;
+  phaseStartUnix = rtc.now().unixtime();
+
+  lpgOff();
+  fanOff();
+  setDimmerPower(0);
+
+  lcd.clear();
+}
+
+void startPreHeatingIntro() {
+  currentPhase = PRE_HEATING_INTRO;
+  phaseStartUnix = rtc.now().unixtime();
+
+  lpgOff();
+  fanOff();
+  setDimmerPower(0);
+
+  lcd.clear();
+}
+
 void startPreHeating() {
   currentPhase = PRE_HEATING;
   phaseStartUnix = rtc.now().unixtime();
 
-  lpgOn();   // LPG relay HIGH during pre-heating countdown
+  lpgOn();   // LPG relay ON during pre-heating
+  fanOff();  // No fan during preheat
+  setDimmerPower(0);
+
+  lcd.clear();
+}
+
+void startRoastingIntro() {
+  currentPhase = ROASTING_INTRO;
+  phaseStartUnix = rtc.now().unixtime();
+
+  lpgOff();
+  fanOn();   // Fan starts for active cooling intro
+  setDimmerPower(0);
 
   lcd.clear();
 }
@@ -197,7 +343,24 @@ void startRoasting() {
   currentPhase = ROASTING;
   phaseStartUnix = rtc.now().unixtime();
 
-  lpgOff();  // LPG OFF after pre-heating
+  lpgOff();
+  fanOn();   // Fan ON for active cooling during roasting
+  
+  // Initialize PID controller
+  pidController.SetMode(AUTOMATIC);
+  pidController.SetOutputLimits(0, 100);  // Output: 0-100%
+  pidOutput = 0;
+
+  lcd.clear();
+}
+
+void startTemberingIntro() {
+  currentPhase = TEMPERING_INTRO;
+  phaseStartUnix = rtc.now().unixtime();
+
+  lpgOff();
+  fanOff();  // Fan OFF for passive cooling intro
+  setDimmerPower(0);
 
   lcd.clear();
 }
@@ -207,6 +370,8 @@ void startTempering() {
   phaseStartUnix = rtc.now().unixtime();
 
   lpgOff();
+  fanOff();  // Fan OFF - passive cooling only
+  setDimmerPower(0);
 
   lcd.clear();
 }
@@ -215,6 +380,8 @@ void finishProcess() {
   currentPhase = DONE;
 
   lpgOff();
+  fanOff();
+  setDimmerPower(0);
 
   lcd.clear();
 }
@@ -229,21 +396,54 @@ void updateLCD() {
     return;
   }
 
+  if (currentPhase == INIT_SCREEN) {
+    printRow(0, "CACAO ROASTER");
+    printRow(1, "Initializing...");
+    return;
+  }
+
+  if (currentPhase == PRE_HEATING_INTRO) {
+    printRow(0, "PRE-HEATING");
+    printRow(1, "Press BTN Start");
+    return;
+  }
+
   if (currentPhase == PRE_HEATING) {
-    printRow(0, "PREHEATING");
-    printRow(1, "Time: " + formatTime(getRemainingTime()));
+    String line1 = "Time: " + formatTime(getRemainingTime());
+    String line2 = "T:" + String((int)currentTemp) + "C";
+    
+    printRow(0, line1);
+    printRow(1, line2);
+    return;
+  }
+
+  if (currentPhase == ROASTING_INTRO) {
+    printRow(0, "ROASTING");
+    printRow(1, "STAGE INTRO...");
     return;
   }
 
   if (currentPhase == ROASTING) {
-    printRow(0, "ROASTING");
-    printRow(1, "Time: " + formatTime(getRemainingTime()));
+    String line1 = "Time: " + formatTime(getRemainingTime()) + " T:" + String((int)currentTemp) + "C";
+    String line2 = "SP:90C PWM:" + String((int)pidOutput) + "%";
+    
+    printRow(0, line1);
+    printRow(1, line2);
+    return;
+  }
+
+  if (currentPhase == TEMPERING_INTRO) {
+    printRow(0, "TEMPERING");
+    printRow(1, "STAGE INTRO...");
     return;
   }
 
   if (currentPhase == TEMPERING) {
-    printRow(0, "TEMPERING");
-    printRow(1, "Time: " + formatTime(getRemainingTime()));
+    String line1 = "Time: " + formatTime(getRemainingTime()) + " T:" + String((int)currentTemp) + "C";
+    String line2 = "Cooling...FAN ON";
+    
+    printRow(0, line1);
+    printRow(1, line2);
     return;
   }
 
@@ -267,9 +467,18 @@ void setup() {
   lcd.clear();
 
   pinMode(PIN_BUTTON, INPUT_PULLUP);
-
   pinMode(PIN_LPG_RELAY, OUTPUT);
+  pinMode(PIN_FAN_RELAY, OUTPUT);
+
   lpgOff();
+  fanOff();
+
+  // Initialize SPI for MAX6675
+  SPI.begin();
+
+  // Initialize dimmer
+  dimmer.begin(NORMAL_MODE, ON);
+  setDimmerPower(0);
 
   printRow(0, "CACAO ROASTER");
   printRow(1, "Initializing");
@@ -289,6 +498,9 @@ void setup() {
   lcd.clear();
   printRow(0, "CACAO ROASTER");
   printRow(1, "Press BTN Start");
+
+  // Start with initialization screen
+  currentPhase = IDLE;
 }
 
 // ==================================================
@@ -297,48 +509,106 @@ void setup() {
 void loop() {
   unsigned long nowMillis = millis();
 
+  // Read temperature continuously
+  readTemperature();
+
   // Button function
   if (buttonPressed()) {
     if (currentPhase == IDLE) {
+      startInitScreen();
+    }
+    else if (currentPhase == INIT_SCREEN) {
+      startPreHeatingIntro();
+    }
+    else if (currentPhase == PRE_HEATING_INTRO) {
       startPreHeating();
     }
     else if (currentPhase == DONE) {
       currentPhase = IDLE;
       lpgOff();
+      fanOff();
+      setDimmerPower(0);
       lcd.clear();
     }
   }
 
   // ==================================================
-  // PRE-HEATING
-  // LPG relay is HIGH while countdown is running
+  // INITIALIZATION SCREEN
   // ==================================================
-  if (currentPhase == PRE_HEATING) {
+  if (currentPhase == INIT_SCREEN) {
+    if (getElapsedTime() >= INIT_TIME_SEC) {
+      startPreHeatingIntro();
+    }
+  }
+
+  // ==================================================
+  // PRE-HEATING INTRO
+  // Waiting for button press
+  // ==================================================
+  else if (currentPhase == PRE_HEATING_INTRO) {
+    // Wait for button press (handled above)
+  }
+
+  // ==================================================
+  // PRE-HEATING
+  // LPG relay is ON, countdown running
+  // ==================================================
+  else if (currentPhase == PRE_HEATING) {
     lpgOn();
+    fanOff();
 
     if (getElapsedTime() >= PRE_HEATING_TIME_SEC) {
+      startRoastingIntro();
+    }
+  }
+
+  // ==================================================
+  // ROASTING INTRO
+  // 5 second intro screen
+  // ==================================================
+  else if (currentPhase == ROASTING_INTRO) {
+    fanOn();  // Fan starts during intro
+
+    if (getElapsedTime() >= STAGE_INTRO_TIME_SEC) {
       startRoasting();
     }
   }
 
   // ==================================================
   // ROASTING
-  // LPG relay is OFF
+  // Dimmer with PID control + Active fan cooling
   // ==================================================
   else if (currentPhase == ROASTING) {
-    lpgOff();
+    fanOn();  // Keep fan ON for active cooling
+
+    // Update PID controller for temperature control
+    updatePIDControl();
 
     if (getElapsedTime() >= ROASTING_TIME_SEC) {
+      startTemberingIntro();
+    }
+  }
+
+  // ==================================================
+  // TEMPERING INTRO
+  // 5 second intro screen
+  // ==================================================
+  else if (currentPhase == TEMPERING_INTRO) {
+    fanOff();  // Fan OFF for passive cooling
+
+    if (getElapsedTime() >= STAGE_INTRO_TIME_SEC) {
       startTempering();
     }
   }
 
   // ==================================================
   // TEMPERING
-  // LPG relay is OFF
+  // Passive cooling, fan OFF
   // ==================================================
   else if (currentPhase == TEMPERING) {
     lpgOff();
+    fanOff();
+    setDimmerPower(0);
 
     if (getElapsedTime() >= TEMPERING_TIME_SEC) {
       finishProcess();
@@ -347,13 +617,20 @@ void loop() {
 
   else if (currentPhase == IDLE) {
     lpgOff();
+    fanOff();
+    setDimmerPower(0);
   }
 
   else if (currentPhase == DONE) {
     lpgOff();
+    fanOff();
+    setDimmerPower(0);
   }
 
-  // Update LCD every 500ms
+  // ==================================================
+  // UPDATE LCD DISPLAY
+  // Update every 500ms to prevent flicker
+  // ==================================================
   if (nowMillis - lastLCDUpdate >= 500) {
     lastLCDUpdate = nowMillis;
     updateLCD();
