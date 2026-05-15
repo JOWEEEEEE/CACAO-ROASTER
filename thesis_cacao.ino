@@ -96,6 +96,7 @@ enum Phase {
 };
 
 Phase currentPhase = IDLE;
+Phase previousPhase = IDLE;  // Track previous phase for LCD updates
 
 // ==================================================
 // VARIABLES
@@ -442,7 +443,7 @@ void updateLCD() {
 
   if (currentPhase == TEMPERING) {
     String line1 = "Time: " + formatTime(getRemainingTime()) + " T:" + String((int)currentTemp) + "C";
-    String line2 = "Cooling...FAN ON";
+    String line2 = "Cooling...FAN OFF";
     
     printRow(0, line1);
     printRow(1, line2);
@@ -500,6 +501,11 @@ void setup() {
 
   // Start with IDLE state
   currentPhase = IDLE;
+  previousPhase = IDLE;
+  
+  // Force first LCD update
+  updateLCD();
+  lastLCDUpdate = millis();
 }
 
 // ==================================================
@@ -628,10 +634,11 @@ void loop() {
 
   // ==================================================
   // UPDATE LCD DISPLAY
-  // Update every 500ms to prevent flicker
+  // Update every 500ms OR when phase changes
   // ==================================================
-  if (nowMillis - lastLCDUpdate >= 500) {
+  if (previousPhase != currentPhase || nowMillis - lastLCDUpdate >= 500) {
     lastLCDUpdate = nowMillis;
+    previousPhase = currentPhase;
     updateLCD();
   }
 }
