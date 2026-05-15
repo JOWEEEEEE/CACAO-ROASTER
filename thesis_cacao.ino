@@ -1,7 +1,6 @@
 #include <Wire.h>
 #include <LiquidCrystal_I2C.h>
 #include <RTClib.h>
-#include <SPI.h>
 #include "max6675.h"
 #include <PID_v1.h>
 #include <RBDdimmer.h>
@@ -20,18 +19,21 @@ LiquidCrystal_I2C lcd(0x27, 16, 2);
 RTC_DS3231 rtc;
 
 // ==================================================
-// MAX6675 THERMOCOUPLE - HARDWARE SPI
+// MAX6675 THERMOCOUPLE - SOFTSPI
+// DO  = Pin 4 (MISO)
+// CLK = Pin 5 (SCK)
+// CS  = Pin 6 (SS)
 // ==================================================
-#define PIN_THERMO_CLK  52   // SCK (hardware SPI - fixed)
-#define PIN_THERMO_CS   53   // CS (can be any digital pin)
-#define PIN_THERMO_DO   50   // MISO (hardware SPI - fixed)
+#define PIN_THERMO_CLK  5
+#define PIN_THERMO_CS   6
+#define PIN_THERMO_DO   4
 
 MAX6675 thermocouple(PIN_THERMO_CLK, PIN_THERMO_CS, PIN_THERMO_DO);
 
 // ==================================================
 // AC DIMMER (RBDDimmer PWM-3)
 // ==================================================
-#define PIN_ZERO_CROSS  2    // INT0 for zero-cross detection (FIXED)
+#define PIN_ZERO_CROSS  2    // INT0 for zero-cross detection
 #define PIN_DIMMER      3    // PWM output for heating element
 
 dimmerLamp dimmer(PIN_DIMMER);
@@ -39,8 +41,8 @@ dimmerLamp dimmer(PIN_DIMMER);
 // ==================================================
 // RELAYS
 // ==================================================
-#define PIN_LPG_RELAY   51   // LPG preheat relay
-#define PIN_FAN_RELAY   11   // Fan cooling relay
+#define PIN_LPG_RELAY   52   // LPG preheat relay
+#define PIN_FAN_RELAY   51   // Fan cooling relay
 
 // ==================================================
 // BUTTON
@@ -162,7 +164,7 @@ void readTemperature() {
   if (nowMillis - lastTempRead >= 100) {
     lastTempRead = nowMillis;
     
-    // Read from MAX6675 (hardware SPI)
+    // Read from MAX6675 (SoftSPI)
     currentTemp = thermocouple.readCelsius();
     
     // Check for sensor error (MAX6675 returns -0.25 on error)
@@ -354,7 +356,7 @@ void startRoasting() {
   lcd.clear();
 }
 
-void startTemberingIntro() {
+void startTemperingIntro() {
   currentPhase = TEMPERING_INTRO;
   phaseStartUnix = rtc.now().unixtime();
 
@@ -473,9 +475,6 @@ void setup() {
   lpgOff();
   fanOff();
 
-  // Initialize SPI for MAX6675
-  SPI.begin();
-
   // Initialize dimmer
   dimmer.begin(NORMAL_MODE, ON);
   setDimmerPower(0);
@@ -499,7 +498,7 @@ void setup() {
   printRow(0, "CACAO ROASTER");
   printRow(1, "Press BTN Start");
 
-  // Start with initialization screen
+  // Start with IDLE state
   currentPhase = IDLE;
 }
 
@@ -585,7 +584,7 @@ void loop() {
     updatePIDControl();
 
     if (getElapsedTime() >= ROASTING_TIME_SEC) {
-      startTemberingIntro();
+      startTemperingIntro();
     }
   }
 
